@@ -1,11 +1,12 @@
 import streamlit as st
-import streamlit.components.v1 as components
-from pyngrok import ngrok
 from rag_system import CareerAI
 from career_data import CAREER_TIPS
-from monitor.gsheet_logger import RealTimeLogger
+# 구글 시트 로거 대신 에러 방지를 위해 로컬 DB만 사용하는 설정으로 변경할 수도 있으나, 
+# 일단 기존 import 유지하되 try-except로 감쌉니다.
 from user_db import init_user_db, save_message, get_all_history 
+from file_utils import extract_text_from_file
 import time
+import os
 
 # -------------------------------------------------------------------------
 # 1. 기본 설정
@@ -19,13 +20,14 @@ hide_st_style = """
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
+    [data-testid="stHeader"] { display: none; }
     
-    /* 화면 바닥 여백 */
     .block-container {
+        padding-top: 2rem !important;
         padding-bottom: 250px !important;
+        max-width: 700px !important;
     }
 
-    /* 입력창 디자인 (Gemini 스타일 + 하단 고정) */
     .stChatInput {
         position: fixed;
         bottom: 40px !important;
@@ -37,7 +39,6 @@ hide_st_style = """
         background-color: transparent !important;
     }
 
-    /* 입력 박스 */
     div[data-testid="stChatInput"] {
         background-color: #f0f4f9 !important;
         border-radius: 30px !important;
@@ -52,7 +53,6 @@ hide_st_style = """
         box-shadow: 0px 4px 15px rgba(0,0,0,0.1) !important;
     }
 
-    /* 텍스트 영역 */
     div[data-testid="stChatInput"] textarea {
         background-color: transparent !important;
         border: none !important;
@@ -87,14 +87,39 @@ def scroll_to_bottom():
     components.html(js, height=0)
 
 # -------------------------------------------------------------------------
-# 2. 시스템 초기화
+# 2. 시스템 초기화 및 예외 처리
 # -------------------------------------------------------------------------
+
+# 🔥 [핵심 수정] Ngrok은 로컬에서만 씁니다. (클라우드에선 에러 안 나게 처리)
+public_url = None
+try:
+    from pyngrok import ngrok
+    # 로컬 환경일 때만 ngrok 실행
+    if os.environ.get("STREAMLIT_SERVER_ADDRESS") != "localhost": 
+        # Streamlit Cloud 등에서는 실행 안 함
+        pass
+    else:
+        # 로컬에서 실행 중이면 연결 시도
+        try:
+            ngrok.kill()
+            public_url = ngrok.connect("127.0.0.1:8502").public_url
+        except:
+            pass
+except ImportError:
+    # pyngrok 라이브러리가 아예 없으면(클라우드 환경) 그냥 넘어감
+    pass
+
+
 @st.cache_resource
 def init_system():
     init_user_db() 
     ai = CareerAI()
     ai.load_data(CAREER_TIPS)
-    logger = RealTimeLogger('monitor/service_key.json', 'CareerLog')
+    # 로그 설정 (파일 없으면 에러 안 나게 처리)
+    try:
+        logger = RealTimeLogger('monitor/service_key.json', 'CareerLog')
+    except:
+        logger = None # 로그 기능 끄기
     return ai, logger
 
 try:
@@ -103,25 +128,22 @@ except Exception as e:
     st.error(f"시스템 오류: {e}")
     st.stop()
 
-@st.cache_resource
-def init_connection():
-    try:
-        ngrok.kill()
-        # 8502 포트로 터널 생성
-        return ngrok.connect("127.0.0.1:8502").public_url
-    except:
-        return None
-public_url = init_connection()
+# 로그 기록 헬퍼 함수 (logger가 없어도 죽지 않게)
+def safe_log(user_id, action, details):
+    if logger:
+        logger.log(user_id, action, details)
+    else:
+        print(f"[{user_id}] {action}: {details}")
 
 # -------------------------------------------------------------------------
 # 3. 메인 UI
 # -------------------------------------------------------------------------
 st.title("🎓 Job-Navigator")
 
-# 🔥 [핵심 추가] 접속 주소 표시 (화면 최상단)
+# Ngrok 주소가 있을 때만 표시 (로컬용)
 if public_url:
-    st.success("👇 친구들에게 이 주소를 보내세요!")
-    st.code(public_url, language="text") # 복사하기 쉬운 코드 박스
+    with st.expander("🔗 (개발용) 친구 초대 링크 보기", expanded=False):
+        st.code(public_url, language="text")
 
 tab1, tab2 = st.tabs(["📝 자소서 첨삭", "⚙️ 관리자"])
 
@@ -144,7 +166,7 @@ with tab1:
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        logger.log("User", "REQ_COACHING", prompt[:30])
+        safe_log("User", "REQ_COACHING", prompt[:30])
 
         with st.chat_message("assistant", avatar="🎓"):
             with st.status("분석 중...", expanded=True) as status:
@@ -174,12 +196,30 @@ with tab2:
     if input_pw == ADMIN_PASSWORD:
         st.success("인증됨")
         
+        # API Key 관리
+        with st.expander("🔑 API Key 업데이트", expanded=True):
+            st.info("보안을 위해 현재 등록된 Key는 표시하지 않습니다. 새로운 Key가 필요할 때만 입력하세요.")
+            new_key = st.text_input("새로운 API Key 입력", type="password", placeholder="AIza...")
+            if st.button("🔄 Key 덮어쓰기"):
+                if new_key.strip():
+                    os.environ["GOOGLE_API_KEY"] = new_key.strip()
+                    st.cache_resource.clear()
+                    st.toast("새로운 Key가 적용되었습니다! 시스템을 재시작합니다.")
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.warning("키를 입력해주세요.")
+
+        st.divider()
+
+        # 사용자 데이터
         st.markdown("##### 📥 사용자 데이터")
         history_df = get_all_history()
         st.dataframe(history_df, use_container_width=True)
         
         st.divider()
         
+        # 지식 추가
         st.markdown("##### 🧠 지식 추가")
         col1, col2 = st.columns([1, 2])
         with col1:
