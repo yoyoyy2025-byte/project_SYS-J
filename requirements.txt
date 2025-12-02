@@ -1,0 +1,9 @@
+streamlit
+google-generativeai
+chromadb
+python-dotenv
+pandas
+pypdf
+python-docx
+gspread
+oauth2client
